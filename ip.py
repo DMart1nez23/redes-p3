@@ -1,70 +1,94 @@
 from iputils import *
+import struct
+import ipaddress
 
-
-class IP:
-    def __init__(self, enlace):
-        """
-        Inicia a camada de rede. Recebe como argumento uma implementação
-        de camada de enlace capaz de localizar os next_hop (por exemplo,
-        Ethernet com ARP).
-        """
-        self.callback = None
-        self.enlace = enlace
-        self.enlace.registrar_recebedor(self.__raw_recv)
+class CamadaRede:
+    def __init__(self, meio_enlace):
+        self.receptor = None
+        self.enlace = meio_enlace
+        self.enlace.registrar_recebedor(self._receptor_cru)
         self.ignore_checksum = self.enlace.ignore_checksum
-        self.meu_endereco = None
+        self.endereco_local = None
+        self.rotas = None
 
-    def __raw_recv(self, datagrama):
-        dscp, ecn, identification, flags, frag_offset, ttl, proto, \
-           src_addr, dst_addr, payload = read_ipv4_header(datagrama)
-        if dst_addr == self.meu_endereco:
-            # atua como host
-            if proto == IPPROTO_TCP and self.callback:
-                self.callback(src_addr, dst_addr, payload)
+    def tratar_tempo_excedido(self, origem, pacote):
+        proximo = self._resolver_proximo(origem)
+
+        tamanho_total = 48
+        ttl_padrao = 64
+        protocolo = IPPROTO_ICMP
+
+        cabecalho = self._gerar_cabecalho(tamanho_total, ttl_padrao, protocolo, self.endereco_local, origem)
+
+        tipo = 11
+        codigo = 0
+        icmp_hdr = struct.pack('!BBHHH', tipo, codigo, 0, 0, 0)
+
+        restante = pacote[:28]
+        verificador = calc_checksum(icmp_hdr + restante)
+
+        icmp_hdr = struct.pack('!BBHHH', tipo, codigo, verificador, 0, 0)
+        self.enlace.enviar(cabecalho + icmp_hdr + restante, proximo)
+
+    def _gerar_cabecalho(self, tamanho, ttl, protocolo, origem, destino, verificador=0):
+        origem = int(ipaddress.IPv4Address(origem))
+        destino = int(ipaddress.IPv4Address(destino))
+
+        cab = struct.pack(
+            '!BBHHHBBHII',
+            (4 << 4) + 5, 0, tamanho, 0, 0,
+            ttl, protocolo, verificador, origem, destino
+        )
+
+        if verificador == 0:
+            verificador = calc_checksum(cab)
+            cab = struct.pack(
+                '!BBHHHBBHII',
+                (4 << 4) + 5, 0, tamanho, 0, 0,
+                ttl, protocolo, verificador, origem, destino
+            )
+
+        return cab
+
+    def _receptor_cru(self, datagrama):
+        dscp, ecn, identificador, flags, deslocamento, ttl, proto, origem, destino, conteudo = read_ipv4_header(datagrama)
+
+        if destino == self.endereco_local:
+            if proto == IPPROTO_TCP and self.receptor:
+                self.receptor(origem, destino, conteudo)
         else:
-            # atua como roteador
-            next_hop = self._next_hop(dst_addr)
-            # TODO: Trate corretamente o campo TTL do datagrama
-            self.enlace.enviar(datagrama, next_hop)
+            proximo = self._resolver_proximo(destino)
+            ttl -= 1
 
-    def _next_hop(self, dest_addr):
-        # TODO: Use a tabela de encaminhamento para determinar o próximo salto
-        # (next_hop) a partir do endereço de destino do datagrama (dest_addr).
-        # Retorne o next_hop para o dest_addr fornecido.
-        pass
+            if ttl == 0:
+                self.tratar_tempo_excedido(origem, datagrama)
+                return
 
-    def definir_endereco_host(self, meu_endereco):
-        """
-        Define qual o endereço IPv4 (string no formato x.y.z.w) deste host.
-        Se recebermos datagramas destinados a outros endereços em vez desse,
-        atuaremos como roteador em vez de atuar como host.
-        """
-        self.meu_endereco = meu_endereco
+            novo_cab = self._gerar_cabecalho(20 + len(datagrama), ttl, proto, origem, destino)
+            novo_pacote = novo_cab + conteudo
+            self.enlace.enviar(novo_pacote, proximo)
 
-    def definir_tabela_encaminhamento(self, tabela):
-        """
-        Define a tabela de encaminhamento no formato
-        [(cidr0, next_hop0), (cidr1, next_hop1), ...]
+    def _resolver_proximo(self, destino):
+        ip_dest = ipaddress.ip_address(destino)
+        alternativas = [
+            (ipaddress.ip_network(rede).prefixlen, via)
+            for rede, via in self.rotas
+            if ip_dest in ipaddress.ip_network(rede)
+        ]
+        return max(alternativas, key=lambda x: x[0])[1] if alternativas else None
 
-        Onde os CIDR são fornecidos no formato 'x.y.z.w/n', e os
-        next_hop são fornecidos no formato 'x.y.z.w'.
-        """
-        # TODO: Guarde a tabela de encaminhamento. Se julgar conveniente,
-        # converta-a em uma estrutura de dados mais eficiente.
-        pass
+    def configurar_endereco(self, local):
+        self.endereco_local = local
 
-    def registrar_recebedor(self, callback):
-        """
-        Registra uma função para ser chamada quando dados vierem da camada de rede
-        """
-        self.callback = callback
+    def configurar_tabela_rotas(self, rotas):
+        self.rotas = rotas
 
-    def enviar(self, segmento, dest_addr):
-        """
-        Envia segmento para dest_addr, onde dest_addr é um endereço IPv4
-        (string no formato x.y.z.w).
-        """
-        next_hop = self._next_hop(dest_addr)
-        # TODO: Assumindo que a camada superior é o protocolo TCP, monte o
-        # datagrama com o cabeçalho IP, contendo como payload o segmento.
-        self.enlace.enviar(datagrama, next_hop)
+    def registrar_receptor(self, receptor):
+        self.receptor = receptor
+
+    def transmitir(self, conteudo, destino):
+        proximo = self._resolver_proximo(destino)
+        tamanho = 20 + len(conteudo)
+        cab = self._gerar_cabecalho(tamanho, 64, 6, self.endereco_local, destino)
+        pacote = cab + conteudo
+        self.enlace.enviar(pacote, proximo)
